@@ -4,23 +4,36 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/prometheus/alertmanager/template"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/aaron5523/prometheus-am-executor/pkg/config"
+	_ "github.com/aaron5523/prometheus-am-executor/pkg/version"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
-
-	"github.com/prometheus/alertmanager/template"
-	"github.com/prometheus/client_golang/prometheus"
- 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
 	listenAddr      = flag.String("l", ":8080", "HTTP Port to listen on")
 	verbose         = flag.Bool("v", false, "Enable verbose/debug logging")
+
+	exporterConfig config.Config
+
+	showVersion   = flag.Bool("version", false, "Show version information.")
+	createToken   = flag.Bool("create-token", false, "Create bearer token for authentication.")
+	configFile    = flag.String("config.file", "config.yaml", "Configuration `file` in YAML format.")
+
+	timeoutOffset = flag.Float64("timeout-offset", 0.5, "Offset to subtract from Prometheus-supplied timeout in `seconds`.")
+
 	processDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+
 		Namespace: "am_executor",
 		Subsystem: "process",
 		Name:      "duration_seconds",
@@ -150,6 +163,7 @@ func amDataToEnv(td *template.Data) []string {
 }
 
 func main() {
+
 	prometheus.MustRegister(processDuration)
 	prometheus.MustRegister(processesCurrent)
 	prometheus.MustRegister(errCounter)
@@ -158,6 +172,36 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// Show version information
+	if *showVersion {
+		v, err := version.Print("prometheus-am-executor")
+		if err != nil {
+			log.Fatalf("Failed to print version information: %#v", err)
+		}
+
+		fmt.Fprintln(os.Stdout, v)
+		os.Exit(0)
+	}
+
+	// Load configuration file
+	err := exporterConfig.LoadConfig(*configFile)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	// Create bearer token
+	if *createToken {
+		token, err := createJWT()
+		if err != nil {
+			log.Fatalf("Bearer token could not be created: %s\n", err.Error())
+		}
+
+		fmt.Printf("Bearer token: %s\n", token)
+		os.Exit(0)
+	}
+
+
 	command := flag.Args()
 	if len(command) == 0 {
 		log.Fatal("Require command")
@@ -168,9 +212,72 @@ func main() {
 	if len(command) > 1 {
 		rnr.args = command[1:]
 	}
-	http.HandleFunc("/", handleWebhook)
-	http.HandleFunc("/_health", handleHealth)
- 	http.Handle("/metrics", promhttp.Handler())
-	log.Println("Listening on", *listenAddr, "and running", command)
-	log.Fatal(http.ListenAndServe(*listenAddr, nil))
+	//http.HandleFunc("/", handleWebhook)
+	//http.HandleFunc("/_health", handleHealth)
+ 	//http.Handle("/metrics", promhttp.Handler())
+	//log.Println("Listening on", *listenAddr, "and running", command)
+	//log.Fatal(http.ListenAndServe(*listenAddr, nil))
+	// Start exporter
+	fmt.Printf("Starting server %s\n", version.Info())
+	fmt.Printf("Build context %s\n", version.BuildContext())
+	fmt.Printf("script_exporter listening on %s\n", *listenAddr)
+
+	// Authentication can be enabled via the 'basicAuth' or 'bearerAuth'
+	// section in the configuration. If authentication is enabled it's
+	// required for all routes.
+	router := http.NewServeMux()
+
+	//router.Handle("/probe", setupMetrics(metricsHandler))
+	router.Handle("/metrics", promhttp.Handler())
+	router.HandleFunc("/", handleWebhook)
+
+	server := &http.Server{
+		Addr:    *listenAddr,
+		Handler: auth(router),
+	}
+
+	// Listen for SIGINT and SIGTERM signals and try to gracefully shutdown
+	// the HTTP server. This ensures that enabled connections are not
+	// interrupted.
+	go func() {
+		term := make(chan os.Signal, 1)
+		signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+		select {
+		case <-term:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			err := server.Shutdown(ctx)
+			if err != nil {
+				log.Printf("Failed to shutdown script_exporter gracefully: %s\n", err.Error())
+				os.Exit(1)
+			}
+
+			log.Printf("Shutdown script_exporter...\n")
+			os.Exit(0)
+		}
+	}()
+
+	// Listen for SIGHUP signal and reload the configuration. If the
+	// configuration could not be reloaded, the old config will continue to be
+	// used.
+	go func() {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		select {
+		case <-hup:
+			err := exporterConfig.LoadConfig(*configFile)
+			if err != nil {
+				log.Printf("Could not reload configuration: %s\n", err.Error())
+			} else {
+				log.Printf("Configuration reloaded\n")
+			}
+		}
+	}()
+
+	if exporterConfig.TLS.Enabled {
+		log.Fatalln(server.ListenAndServeTLS(exporterConfig.TLS.Crt, exporterConfig.TLS.Key))
+	} else {
+		log.Fatalln(server.ListenAndServe())
+	}
 }
